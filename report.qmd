@@ -8,27 +8,212 @@ format: typst
 ## **Part 0: libraries**
 
 ```{r}
-
+install.packages("dplyr")
+install.packages("ggplot2")
+install.packages("tidyverse")
+install.packages("ragg")
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
 ```
 
 ## **Part 1:** **Defining Research Question**
 
-Chosen Question:
+Chosen Question: 
 
 ## **Part 2: Data Preparation and Cleaning**
 
 ```{r}
+files_to_load <- c(
+  "renew-use-2021.csv", "renew-use-2022.csv", "renew-use-2023.csv",
+  "total-use-2021.csv", "total-use-2022.csv", "total-use-2023.csv",
+  "av-energy-price-2021-2023.csv", 
+  "ev-registrations-by-state-2023.csv"
+)
 
+# Custom function to clean column names using Base R string manipulation
+clean_col_names_base <- function(col_name) {
+  # 1. Convert to lowercase
+  name <- tolower(col_name)
+  # 2. Replace spaces, hyphens, and parentheses with underscores
+  name <- gsub("[\\s\\-()]+", "_", name)
+  # 3. Remove any remaining non-alphanumeric/non-underscore characters
+  name <- gsub("[^a-z0-9_]+", "", name)
+  # 4. Remove leading/trailing underscores
+  name <- gsub("^_+|_+$", "", name)
+  return(name)
+}
+# Load data into a list, applying the custom cleaning function
+list_of_dfs <- map(files_to_load, ~ {
+  df <- read_csv(.x, show_col_types = FALSE) %>%
+    # Apply custom cleaning function to all column names
+    rename_with(clean_col_names_base)
+  
+  message(paste("Loaded and cleaned column names for:", .x))
+  return(df)
+})
+# Name the list elements for easy access
+names(list_of_dfs) <- c(
+  "renew_2021", "renew_2022", "renew_2023", 
+  "total_2021", "total_2022", "total_2023", 
+  "avg_price", 
+  "ev_reg_2023"
+)
+# Create a master mapping table
+state_map_df <- data.frame(
+  abbrev = state.abb,
+  full = state.name
+) %>%
+  add_row(abbrev = "DC", full = "District of Columbia") %>%
+  add_row(abbrev = "US", full = "United States")
+
+standardize_state_names <- function(df, state_col_name) {
+  df_standardized <- df %>%
+    rename(state_input = all_of(state_col_name)) %>%
+    
+    left_join(state_map_df, by = c("state_input" = "abbrev")) %>%
+    
+  
+    
+    mutate(
+        state_temp = ifelse(nchar(state_input) <= 3 & !is.na(full), full, state_input)
+    ) %>%
+    
+    mutate(state = ifelse(nchar(state_temp) <= 3 & is.na(coalesce(full, state_input)), state_input, state_temp)) %>%
+    
+    mutate(state = coalesce(full, state_input, state_temp)) %>% # Final check to be robust
+    
+    filter(!(state %in% c("United States", "Puerto Rico", "Guam", NA))) %>%
+    
+    select(-state_input, -abbrev, -full, -state_temp) %>%
+    
+    rename(state = state)
+
+  return(df_standardized)
+}
+# --- 4. APPLY STANDARDIZATION TO ALL DATASETS ---
+
+dfs_cleaned <- list_of_dfs
+
+for (name in names(dfs_cleaned)) {
+  df <- dfs_cleaned[[name]]
+  
+  
+  if ("state" %in% names(df)) {
+    state_col <- "state" 
+  } else if ("state_name" %in% names(df)) {
+    state_col <- "state_name"
+  } else {
+    message(paste("\n!!! MANUAL CHECK NEEDED: State column not obvious in", name))
+    next 
+  }
+  
+  dfs_cleaned[[name]] <- standardize_state_names(df, state_col_name = state_col)
+  
+  message(paste("\nSuccessfully standardized states for:", name))
+}
+
+message("\n--- FINAL CHECK: Head of EV Registrations DataFrame (States should be full names) ---")
+print(head(dfs_cleaned$ev_reg_2023))
 ```
 
 ## **Part 3: Joining / Pivoting Datasets for Analysis**
 
 ```{r}
+renew_2023_focus <- dfs_cleaned$renew_2023 %>%
+  select(state, year_renew = year, renewable_use = value) 
 
+total_2023_focus <- dfs_cleaned$total_2023 %>%
+  select(state, year_total = year, total_use = value) 
+
+# 3. Merge the two tables
+energy_mix_2023_df <- renew_2023_focus %>%
+  left_join(total_2023_focus, by = "state") %>%
+  # Filter out any rows where total use is zero or missing to prevent division by zero
+  filter(total_use > 0 & !is.na(total_use)) %>%
+  # 4. Create New Variable: Renewable Share Percentage
+  mutate(
+    renewable_share_percent = (renewable_use / total_use) * 100
+  )
+
+# Summary check:
+print(head(energy_mix_2023_df))
+summary(energy_mix_2023_df$renewable_share_percent)
+
+ev_focus <- dfs_cleaned$ev_reg_2023 %>%
+  select(state, ev_registrations = registrations, population = total_population) # Placeholder names
+
+# 2. Merge the Energy Mix and EV data
+adoption_energy_df <- energy_mix_2023_df %>%
+  left_join(ev_focus, by = "state") %>%
+  # Filter out rows where EV data is missing
+  filter(!is.na(ev_registrations)) %>%
+  # 3. Create New Variable: EV Density (Registrations per 100,000 people)
+  mutate(
+    ev_density_per_100k_pop = (ev_registrations / population) * 100000
+  )
+  
+# Summary check:
+print(head(adoption_energy_df))
 ```
 
 ## **Part 4: Mapping Visualization**
 
 ```{r}
+# Load mapping libraries
+install.packages(c("sf", "rnaturalearth", "rnaturalearthdata"))
+library(sf)
+library(rnaturalearth)
+library(ggplot2)
 
+# --- A. Prepare Spatial Data ---
+# Get US state boundaries data (often easiest with maps package or sf)
+# Using the built-in map_data for simplicity with ggplot2 states
+us_states <- map_data("state")
+
+# Crucial Step: Clean the spatial data names to match your analytical data ('state' column)
+# Convert state names in map data to lowercase for joining (since our analytical data is full name, this might require adjustment)
+# For this example, we assume the 'state' column in map_data is lowercase, so we must adjust our analysis data.
+
+# Re-run the cleaning step specifically for map matching (if needed, otherwise rely on the previous standardization)
+# Let's ensure our analytical data is also lower case for the map join:
+map_ready_df <- energy_mix_2023_df %>%
+  mutate(state_lower = tolower(state))
+
+# --- B. Merge Analytical Data with Spatial Data ---
+us_map_data <- us_states %>%
+  # Join analytical data based on the lowercase state name
+  left_join(map_ready_df, by = c("region" = "state_lower"))
+
+# --- C. Create the Choropleth Map ---
+
+map_renewable_share <- ggplot(us_map_data, aes(x = long, y = lat, group = group, fill = renewable_share_percent)) +
+  
+  # Draw the polygons (states)
+  geom_polygon(color = "white", linewidth = 0.2) + # White borders between states
+  
+  # Set the color scale (e.g., sequential scale for low to high percentage)
+  scale_fill_viridis_c(
+    option = "D", # Viridis "D" palette is perceptually uniform
+    name = "Renewable Share (%)",
+    na.value = "gray80", # Color for states with missing data
+    limits = c(0, max(na.omit(energy_mix_2023_df$renewable_share_percent))) # Set consistent limits
+  ) +
+  
+  # Set map aesthetics
+  coord_map() + # Ensures correct aspect ratio
+  labs(
+    title = "2023 Share of Electricity Generated from Renewable Sources by State",
+    subtitle = "Higher percentages indicate a cleaner energy mix used for EV charging.",
+    caption = "Source: State Energy Data - U.S. Renewable and Total Energy Use Files"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_blank(), # Remove latitude/longitude labels
+    axis.text = element_blank()
+  )
+ragg_png
+# Display the map (in your R environment)
+print(map_renewable_share)
 ```
